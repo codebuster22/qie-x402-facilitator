@@ -1,7 +1,91 @@
-import { handleSupported } from "./handlers/supported";
-import { handleVerify } from "./handlers/verify";
-import { handleSettle } from "./handlers/settle";
-import { config } from "./config";
+import { x402Facilitator } from "@x402/core/facilitator";
+import { toFacilitatorEvmSigner } from "@x402/evm";
+import { registerExactEvmScheme } from "@x402/evm/exact/facilitator";
+import {
+  createWalletClient,
+  http,
+  publicActions,
+} from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { qieChain } from "./config";
+
+// Fixed gas limit for all transactions on QIE network
+// Required because QIE's eth_estimateGas returns insufficient gas (24,000)
+const FIXED_GAS_LIMIT = 1_000_000n;
+
+// Validate environment
+if (!process.env.FACILITATOR_PRIVATE_KEY) {
+  throw new Error("FACILITATOR_PRIVATE_KEY environment variable is required");
+}
+
+// Create Viem account from private key
+const account = privateKeyToAccount(
+  process.env.FACILITATOR_PRIVATE_KEY as `0x${string}`
+);
+
+console.log("Facilitator address:", account.address);
+
+// Create wallet client with public actions (combined client)
+// This gives us both read (publicClient) and write (walletClient) capabilities
+const client = createWalletClient({
+  account,
+  chain: qieChain,
+  transport: http(),
+}).extend(publicActions);
+
+// Create a gas-injected wrapper to ensure all transactions use FIXED_GAS_LIMIT
+// This is necessary because x402's FacilitatorEvmSigner interface doesn't expose gas params
+const gasInjectedClient = {
+  ...client,
+  writeContract: (args: Parameters<typeof client.writeContract>[0]) =>
+    client.writeContract({ ...args, gas: FIXED_GAS_LIMIT }),
+  sendTransaction: (args: Parameters<typeof client.sendTransaction>[0]) =>
+    client.sendTransaction({ ...args, gas: FIXED_GAS_LIMIT }),
+};
+
+// Convert to x402 facilitator signer
+// Using type assertion due to minor type incompatibility between viem and x402 signer interface
+const evmSigner = toFacilitatorEvmSigner(
+  gasInjectedClient as unknown as Parameters<typeof toFacilitatorEvmSigner>[0]
+);
+
+// Helper to safely extract authorization from payload
+function getAuthFrom(payload: unknown): string {
+  const p = payload as { payload?: { authorization?: { from?: string } } };
+  return p?.payload?.authorization?.from || "unknown";
+}
+
+// Create x402 Facilitator with lifecycle hooks
+const facilitator = new x402Facilitator()
+  .onBeforeVerify(async (ctx) => {
+    console.log("[verify] From:", getAuthFrom(ctx.paymentPayload));
+  })
+  .onAfterVerify(async (ctx) => {
+    console.log("[verify] Result:", ctx.result.isValid);
+  })
+  .onVerifyFailure(async (ctx) => {
+    console.error("[verify] Failed:", ctx.error.message);
+  })
+  .onBeforeSettle(async (ctx) => {
+    console.log("[settle] Processing payment from:", getAuthFrom(ctx.paymentPayload));
+  })
+  .onAfterSettle(async (ctx) => {
+    console.log("[settle] Result:", ctx.result.success);
+    console.log(ctx.result);
+    console.log(ctx.paymentPayload);
+    if (ctx.result.success) {
+      console.log("[settle] Transaction:", ctx.result.transaction);
+    }
+  })
+  .onSettleFailure(async (ctx) => {
+    console.error("[settle] Failed:", ctx.error.message);
+  });
+
+// Register EVM exact scheme for QIE network (eip155:1990)
+registerExactEvmScheme(facilitator, {
+  signer: evmSigner,
+  networks: "eip155:1990",
+});
 
 // CORS headers for cross-origin requests
 const corsHeaders = {
@@ -10,96 +94,67 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
-/**
- * Add CORS headers to a response
- */
-function addCorsHeaders(response: Response): Response {
-  const newHeaders = new Headers(response.headers);
-  Object.entries(corsHeaders).forEach(([key, value]) => {
-    newHeaders.set(key, value);
-  });
-
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: newHeaders,
-  });
-}
-
+// HTTP server
 const server = Bun.serve({
-  port: config.port,
+  port: parseInt(process.env.PORT || "3000", 10),
 
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const path = url.pathname;
-    const method = request.method;
+  async fetch(req) {
+    const url = new URL(req.url);
 
-    // Handle CORS preflight requests
-    if (method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders,
-      });
+    // Handle CORS preflight
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders });
     }
-
-    let response: Response;
 
     try {
-      // Route matching
-      if (path === "/supported" && method === "GET") {
-        response = handleSupported();
-      } else if (path === "/verify" && method === "POST") {
-        response = await handleVerify(request);
-      } else if (path === "/settle" && method === "POST") {
-        response = await handleSettle(request);
-      } else if (path === "/health" && method === "GET") {
-        response = Response.json({ status: "ok", timestamp: Date.now() });
-      } else if (path === "/" && method === "GET") {
-        response = Response.json({
-          name: "x402 Facilitator",
-          version: config.x402Version,
-          network: config.networkId,
-          endpoints: {
-            supported: "GET /supported",
-            verify: "POST /verify",
-            settle: "POST /settle",
-            health: "GET /health",
-          },
-        });
+      let result: unknown;
+
+      if (req.method === "GET" && url.pathname === "/supported") {
+        result = facilitator.getSupported();
+      } else if (req.method === "POST" && url.pathname === "/verify") {
+        const body = (await req.json()) as {
+          paymentPayload: Parameters<typeof facilitator.verify>[0];
+          paymentRequirements: Parameters<typeof facilitator.verify>[1];
+        };
+        result = await facilitator.verify(body.paymentPayload, body.paymentRequirements);
+      } else if (req.method === "POST" && url.pathname === "/settle") {
+        const body = (await req.json()) as {
+          paymentPayload: Parameters<typeof facilitator.settle>[0];
+          paymentRequirements: Parameters<typeof facilitator.settle>[1];
+        };
+        result = await facilitator.settle(body.paymentPayload, body.paymentRequirements);
+        console.log(result);
+      } else if (req.method === "GET" && url.pathname === "/health") {
+        result = { status: "ok", timestamp: Date.now() };
+      } else if (req.method === "GET" && url.pathname === "/") {
+        result = {
+          name: "x402 Facilitator for QIE",
+          network: "eip155:1990",
+          facilitator: account.address,
+          endpoints: ["/supported", "/verify", "/settle", "/health"],
+        };
       } else {
-        response = Response.json(
-          { error: "Not Found", path, method },
-          { status: 404 }
+        return Response.json(
+          { error: "Not Found" },
+          { status: 404, headers: corsHeaders }
         );
       }
+
+      return Response.json(result, { headers: corsHeaders });
     } catch (error) {
-      console.error("Unhandled error:", error);
-      response = Response.json(
-        {
-          error: "Internal Server Error",
-          message: error instanceof Error ? error.message : "Unknown error",
-        },
-        { status: 500 }
+      console.error("Error:", error);
+      return Response.json(
+        { error: error instanceof Error ? error.message : "Unknown error" },
+        { status: 500, headers: corsHeaders }
       );
     }
-
-    // Add CORS headers to all responses
-    return addCorsHeaders(response);
   },
 });
 
 console.log(`
-╔═══════════════════════════════════════════════════════════╗
-║             x402 Facilitator for QIE Blockchain           ║
-╠═══════════════════════════════════════════════════════════╣
-║  Network:    ${config.networkId.padEnd(43)}║
-║  Listening:  http://localhost:${String(server.port).padEnd(27)}║
-╠═══════════════════════════════════════════════════════════╣
-║  Endpoints:                                               ║
-║    GET  /           - Service info                        ║
-║    GET  /supported  - Supported schemes & networks        ║
-║    POST /verify     - Verify payment authorization        ║
-║    POST /settle     - Execute payment on-chain            ║
-║    GET  /health     - Health check                        ║
-╚═══════════════════════════════════════════════════════════╝
+x402 Facilitator for QIE Blockchain
+===================================
+Network:    eip155:1990 (QIE Mainnet)
+Listening:  http://localhost:${server.port}
+Endpoints:  /supported, /verify, /settle, /health
 `);

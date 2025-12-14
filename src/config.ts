@@ -20,15 +20,3 @@ export const qieChain = defineChain({
     },
   },
 });
-
-export const config = {
-  port: parseInt(process.env.PORT || "3000", 10),
-  facilitatorPrivateKey: process.env.FACILITATOR_PRIVATE_KEY as `0x${string}`,
-  qusdContractAddress: process.env.QUSD_CONTRACT_ADDRESS as `0x${string}`,
-  networkId: "eip155:1990",
-  scheme: "exact" as const,
-  x402Version: 1,
-  // EIP-712 domain values for qUSD
-  tokenName: "qUSD",
-  tokenVersion: "1",
-};
