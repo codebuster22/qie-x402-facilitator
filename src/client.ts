@@ -25,7 +25,7 @@ const extendedWriteContract =
     });
 
     try {
-      const gasEstimate = await client.request({
+      const gasEstimateResponse = await client.request({
         method: "eth_estimateGas",
         params: [
           {
@@ -35,8 +35,20 @@ const extendedWriteContract =
           },
         ],
       });
+      const fillTransactionResponse = await client.request({
+        method: "eth_fillTransaction",
+        params: [
+          {
+            from: client.account.address,
+            to: args.address,
+            data: requestData,
+          },
+        ],
+      });
 
-      args.gas = BigInt(gasEstimate);
+      console.log({gasEstimateResponse, fillTransactionResponse});
+
+      args.gas = BigInt(gasEstimateResponse);
 
       return await client.writeContract(args as any);
     } catch (error) {
